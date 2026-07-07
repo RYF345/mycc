@@ -22,6 +22,10 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}},
     {"name": "load_skill", "description": "Load the full content of a skill by name.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+    {"name": "compact", "description": "Manually trigger context compaction to free up space. Use when context is getting large.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "debug_messages", "description": "Show current message count and recent message info for debugging compact feature.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
 ]
 
 
@@ -132,7 +136,26 @@ def run_todo_write(todos: list | None) -> str:
     return f"Updated {len(CURRENT_TODOS)} tasks"
 
 
+def run_compact() -> str:
+    """
+    Compact 工具的处理函数
+
+    业务逻辑：
+    - 这个函数只是返回占位符信息
+    - 真正的压缩逻辑在 agent_loop.py 中处理
+    - 当检测到 compact 工具调用时，agent_loop 会：
+      1. 调用 compact_history(messages)
+      2. 返回此函数的结果
+      3. break 结束当前 turn，用压缩后的上下文开始新一轮
+
+    Returns:
+        占位符信息（真正的压缩在 agent_loop 中执行）
+    """
+    return "[Compact requested. History will be summarized.]"
+
+
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write,
+    "compact": run_compact,
 }

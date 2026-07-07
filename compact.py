@@ -40,7 +40,7 @@ def estimate_token_count(messages: list) -> int:
     粗略估算消息列表的 token 数量
 
     业务逻辑：
-    - 将所有消息内容序列化为 JSON 字符串
+    - 将所有消息内容转换为字符串累加
     - 使用简单的字符数除以 3 来估算 token 数（英文约 4 字符/token，中文约 2 字符/token）
     - 这是快速估算，不需要精确的 tokenizer
 
@@ -50,7 +50,26 @@ def estimate_token_count(messages: list) -> int:
     Returns:
         估算的 token 数量
     """
-    total_chars = len(json.dumps(messages, ensure_ascii=False))
+    total_chars = 0
+    for message in messages:
+        # 计算 role 的长度
+        total_chars += len(message.get("role", ""))
+
+        # 计算 content 的长度
+        content = message.get("content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            for block in content:
+                # 如果是字典，序列化为 JSON
+                if isinstance(block, dict):
+                    total_chars += len(json.dumps(block, ensure_ascii=False))
+                # 如果是 API 对象，转换为字符串
+                else:
+                    total_chars += len(str(block))
+        else:
+            total_chars += len(str(content))
+
     return total_chars // 3
 
 
@@ -251,3 +270,278 @@ def persist_large_output(tool_use_id: str, content: str) -> str:
     )
 
     return placeholder
+
+
+# ── L3: tool_result_budget ────────────────────────────────
+def tool_result_budget(messages: list, max_bytes: int = TOOL_RESULT_BUDGET_BYTES) -> list:
+    """
+    L3: 大结果落盘
+
+    业务逻辑：
+    - 只处理最后一条 user 消息（最新的工具执行结果）
+    - 统计该消息中所有 tool_result 的总大小
+    - 如果超过预算（200KB），按大小排序，从最大的开始落盘
+    - 落盘后的 tool_result 被替换为带预览的占位符
+
+    为什么只处理最后一条：
+    - 旧的 tool_result 会被 micro_compact 处理
+    - 最后一条是刚执行的，最有可能包含大内容
+    - 这一层的目标是防止单次工具执行就打满上下文
+
+    Args:
+        messages: 消息列表
+        max_bytes: 最大字节限制
+
+    Returns:
+        压缩后的消息列表
+    """
+    if not messages:
+        return messages
+
+    last_message = messages[-1]
+
+    # 只处理 user 消息
+    if last_message.get("role") != "user":
+        return messages
+
+    content = last_message.get("content", [])
+    if not isinstance(content, list):
+        return messages
+
+    # 收集所有 tool_result blocks
+    tool_result_blocks = [
+        (idx, block) for idx, block in enumerate(content)
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    ]
+
+    if not tool_result_blocks:
+        return messages
+
+    # 计算总大小
+    total_bytes = sum(len(str(block.get("content", ""))) for _, block in tool_result_blocks)
+
+    if total_bytes <= max_bytes:
+        return messages
+
+    # 按大小排序（从大到小）
+    sorted_blocks = sorted(
+        tool_result_blocks,
+        key=lambda p: len(str(p[1].get("content", ""))),
+        reverse=True
+    )
+
+    # 从最大的开始落盘，直到总大小低于预算
+    persisted_count = 0
+    for idx, block in sorted_blocks:
+        if total_bytes <= max_bytes:
+            break
+
+        original_content = str(block.get("content", ""))
+        original_size = len(original_content)
+
+        # 落盘并替换为占位符
+        tool_use_id = block.get("tool_use_id", f"unknown_{idx}")
+        placeholder = persist_large_output(tool_use_id, original_content)
+        block["content"] = placeholder
+
+        # 重新计算总大小
+        total_bytes = total_bytes - original_size + len(placeholder)
+        persisted_count += 1
+
+    if persisted_count > 0:
+        print(f"\033[90m[COMPACT] tool_result_budget: 落盘 {persisted_count} 个大结果\033[0m")
+
+    return messages
+
+
+# ── L4: compact_history 辅助函数 ──────────────────────────
+def write_transcript(messages: list) -> Path:
+    """
+    保存完整对话记录到磁盘
+
+    业务逻辑：
+    - 在 compact_history 执行前，先保存完整对话
+    - 文件名使用时间戳确保唯一性
+    - 格式为 JSONL（每行一条消息的 JSON）
+    - 这样即使压缩后丢失细节，也能从 transcript 恢复
+
+    注意：教学版不提供 transcript 检索工具，只是保存备份
+
+    Args:
+        messages: 消息列表
+
+    Returns:
+        transcript 文件路径
+    """
+    # 生成带时间戳的文件名
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    filename = f"transcript-{timestamp}.jsonl"
+    filepath = TRANSCRIPTS_DIR / filename
+
+    # 写入 JSONL 格式（每行一条消息）
+    with open(filepath, "w", encoding="utf-8") as f:
+        for message in messages:
+            f.write(json.dumps(message, ensure_ascii=False) + "\n")
+
+    print(f"\033[90m[COMPACT] 保存 transcript: {filepath.relative_to(WORKDIR)}\033[0m")
+
+    return filepath
+
+
+def summarize_history(messages: list) -> str:
+    """
+    使用 LLM 生成对话历史的摘要
+
+    业务逻辑：
+    - 构造一个专门的 prompt，要求 LLM 提取关键信息
+    - 保留：当前目标、重要发现、已修改文件、剩余工作、用户约束
+    - 摘要应该足够详细，让 AI 能继续当前工作
+    - 但比原始对话短很多，节省 token
+
+    Args:
+        messages: 原始消息列表
+
+    Returns:
+        摘要字符串
+    """
+    # 构造摘要 prompt
+    summary_prompt = """请总结以下对话历史，保留关键信息：
+
+1. **当前目标**：用户要完成什么任务？
+2. **重要发现**：在探索代码/文件时发现了什么关键信息？
+3. **已完成的工作**：修改了哪些文件？做了什么更改？
+4. **剩余工作**：还有什么任务未完成？
+5. **用户约束/偏好**：用户提出了哪些特殊要求或限制？
+
+请用简洁但完整的方式总结，确保我能继续当前工作。
+
+CRITICAL: 只输出文本摘要，不要调用任何工具。"""
+
+    try:
+        # 调用 LLM 生成摘要
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=4000,
+            messages=messages + [{"role": "user", "content": summary_prompt}]
+        )
+
+        # 提取文本内容
+        summary_text = ""
+        for block in response.content:
+            # TODO: 改进类型检查 - 目前使用 hasattr，可以根据 block.type == "text" 来判断
+            if hasattr(block, "text"):
+                summary_text += block.text
+
+        return summary_text.strip() if summary_text else "[摘要生成失败]"
+
+    except Exception as e:
+        print(f"\033[31m[COMPACT] 摘要生成失败: {e}\033[0m")
+        return f"[摘要生成失败: {e}]"
+
+
+# ── L4: compact_history ───────────────────────────────────
+def compact_history(messages: list) -> list:
+    """
+    L4: LLM 全量摘要
+
+    业务逻辑：
+    - 前三层（L1/L2/L3）都是文本操作，不调用 API
+    - 当前三层都无法满足 token 要求时，触发这一层
+    - 三步流程：保存 transcript → LLM 生成摘要 → 替换消息列表
+    - 这会丢失对话细节，但保留了关键信息让 AI 继续工作
+
+    熔断器：
+    - 使用全局变量 compact_failure_count 跟踪连续失败次数
+    - 连续失败 3 次后停止重试，防止无限循环
+    - 成功后重置计数器
+
+    Args:
+        messages: 原始消息列表
+
+    Returns:
+        压缩后的消息列表（只包含一条摘要消息）
+    """
+    global compact_failure_count
+
+    # 熔断器检查
+    if compact_failure_count >= MAX_COMPACT_FAILURES:
+        print(f"\033[31m[COMPACT] 连续失败 {compact_failure_count} 次，停止压缩\033[0m")
+        raise RuntimeError("Compact history failed too many times")
+
+    try:
+        # 步骤 1: 保存 transcript
+        transcript_path = write_transcript(messages)
+
+        # 步骤 2: LLM 生成摘要
+        print(f"\033[90m[COMPACT] compact_history: 开始生成摘要...\033[0m")
+        summary = summarize_history(messages)
+
+        # 步骤 3: 替换消息列表
+        compacted_messages = [
+            {
+                "role": "user",
+                "content": f"[Auto Compacted]\n\n{summary}\n\n(完整对话已保存至 {transcript_path.relative_to(WORKDIR)})"
+            }
+        ]
+
+        # 成功，重置失败计数器
+        compact_failure_count = 0
+
+        print(f"\033[92m[COMPACT] compact_history: 压缩完成，从 {len(messages)} 条消息压缩为 1 条摘要\033[0m")
+
+        return compacted_messages
+
+    except Exception as e:
+        compact_failure_count += 1
+        print(f"\033[31m[COMPACT] compact_history 失败 ({compact_failure_count}/{MAX_COMPACT_FAILURES}): {e}\033[0m")
+        raise
+
+
+# ── 应急: reactive_compact ───────────────────────────────
+def reactive_compact(messages: list) -> list:
+    """
+    应急: reactive_compact
+
+    业务逻辑：
+    - 当 API 返回 prompt_too_long 错误时触发
+    - 比 compact_history 更激进：保留最后 5 条消息
+    - 同样先保存 transcript，再生成摘要
+    - 边界保护：确保不把 tool_use 和 tool_result 拆开
+
+    为什么需要这个：
+    - 有时上下文增长速度快于压缩触发速度
+    - proactive compact (compact_history) 可能没来得及执行
+    - 这是最后一道防线
+
+    Args:
+        messages: 原始消息列表
+
+    Returns:
+        压缩后的消息列表（摘要 + 最后几条消息）
+    """
+    # 保存 transcript
+    transcript_path = write_transcript(messages)
+
+    # 生成摘要
+    print(f"\033[93m[COMPACT] reactive_compact: API 返回 prompt_too_long，执行应急压缩\033[0m")
+    summary = summarize_history(messages)
+
+    # 保留最后 5 条消息
+    tail_start = max(0, len(messages) - 5)
+
+    # 边界保护：如果 tail_start 是 tool_result，向前包含 tool_use
+    if tail_start > 0 and _is_tool_result_message(messages[tail_start]) and _message_has_tool_use(messages[tail_start - 1]):
+        tail_start -= 1
+
+    # 构造压缩后的消息列表
+    compacted_messages = [
+        {
+            "role": "user",
+            "content": f"[Reactive Compact]\n\n{summary}\n\n(完整对话已保存至 {transcript_path.relative_to(WORKDIR)})"
+        }
+    ] + messages[tail_start:]
+
+    print(f"\033[93m[COMPACT] reactive_compact: 从 {len(messages)} 条压缩为摘要 + {len(messages) - tail_start} 条最近消息\033[0m")
+
+    return compacted_messages
+
