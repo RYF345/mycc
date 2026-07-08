@@ -43,24 +43,150 @@ from compact import (
     MAX_REACTIVE_RETRIES
 )
 
-# ── The core pattern: a while loop that calls tools until the model stops ──
-rounds_since_todo = 0
+import json
+
+# ── Prompt Sections ──────────────────────────────────────
+
+PROMPT_SECTIONS = {
+    "identity": "You are a coding agent. Act, don't explain.",
+    "workspace": f"Working directory: {WORKDIR}",
+    "tools": "Use available tools to complete tasks.",
+    "skills_template": "Skills available:\n{catalog}\nUse load_skill to get full details when needed.",
+    "memory_template": "Memory Index:\n{content}",
+}
 
 
-def build_system() -> str:
-    catalog = list_skills()
+def assemble_system_prompt(context: dict) -> str:
+    """
+    根据 context 动态选择并拼接 prompt sections
 
-    # 读取记忆索引
+    Args:
+        context: 包含当前状态的字典
+            - skills_catalog: 技能目录字符串（可选）
+            - memory_index: 记忆索引内容（可选）
+
+    Returns:
+        拼接后的 system prompt 字符串
+
+    业务逻辑：
+    1. 始终加载：identity、workspace、tools
+    2. 按需加载：
+       - 如果 context 中有 skills_catalog，加载 skills section
+       - 如果 context 中有 memory_index，加载 memory section
+    3. 用 "\n\n" 连接所有 sections
+    """
+    sections = []
+
+    # 始终加载
+    sections.append(PROMPT_SECTIONS["identity"])
+    sections.append(PROMPT_SECTIONS["workspace"])
+    sections.append(PROMPT_SECTIONS["tools"])
+
+    # 按需加载 - skills
+    skills_catalog = context.get("skills_catalog", "")
+    if skills_catalog:
+        sections.append(PROMPT_SECTIONS["skills_template"].format(catalog=skills_catalog))
+
+    # 按需加载 - memory
+    memory_index = context.get("memory_index", "")
+    if memory_index:
+        sections.append(PROMPT_SECTIONS["memory_template"].format(content=memory_index))
+
+    return "\n\n".join(sections)
+
+
+def update_context(context: dict, messages: list) -> dict:
+    """
+    从真实状态更新 context
+
+    Args:
+        context: 当前 context（可能为空）
+        messages: 对话历史（未使用，保留以备后续扩展）
+
+    Returns:
+        更新后的 context 字典
+
+    业务逻辑：
+    1. 读取技能目录（通过 list_skills()）
+    2. 检查记忆索引文件是否存在且有内容
+    3. 返回包含实际状态的 context 字典
+
+    为什么基于真实状态而不是关键词：
+    - 文件可能在对话中被创建或删除
+    - 不依赖消息内容，避免误判
+    - 保证 system prompt 反映当前真实环境
+    """
+    # 读取技能目录
+    skills_catalog = list_skills()
+
+    # 检查记忆索引文件
     memory_index = ""
     if MEMORY_INDEX.exists():
-        memory_index = MEMORY_INDEX.read_text(encoding="utf-8")
+        content = MEMORY_INDEX.read_text(encoding="utf-8").strip()
+        if content:
+            memory_index = content
 
-    return (
-        f"You are a coding agent at {WORKDIR}. "
-        f"Skills available:\n{catalog}\n"
-        "Use load_skill to get full details when needed.\n\n"
-        f"Memory Index:\n{memory_index}\n"
-    )
+    return {
+        "skills_catalog": skills_catalog,
+        "memory_index": memory_index,
+    }
+
+
+# ── Caching ──────────────────────────────────────────────
+
+_last_context_key = None
+_last_prompt = None
+
+
+def get_system_prompt(context: dict) -> str:
+    """
+    缓存包装器 - 只在 context 变化时重新组装
+
+    Args:
+        context: 当前状态字典
+
+    Returns:
+        组装好的 system prompt
+
+    业务逻辑：
+    1. 使用 json.dumps 将 context 序列化为确定性字符串作为 cache key
+    2. 如果 key 与上次相同，返回缓存的 prompt（避免重复拼接）
+    3. 如果 key 不同，调用 assemble_system_prompt() 重新组装
+    4. 更新缓存并返回新 prompt
+
+    为什么用 json.dumps 而不是 hash()：
+    - Python 的 hash() 有进程随机化（PYTHONHASHSEED）
+    - hash() 对 dict/list 会报错 "unhashable type"
+    - json.dumps(sort_keys=True) 保证相同内容产生相同字符串
+
+    注意：
+    - 这个缓存只避免字符串拼接的重复计算（进程内优化）
+    - 与 Claude API 的 prompt cache 无关（那是服务端缓存）
+    """
+    global _last_context_key, _last_prompt
+
+    # 生成确定性 cache key
+    key = json.dumps(context, sort_keys=True, ensure_ascii=False)
+
+    # 检查缓存
+    if key == _last_context_key and _last_prompt:
+        print("  \033[90m[cache hit] system prompt unchanged\033[0m")
+        return _last_prompt
+
+    # 缓存未命中，重新组装
+    _last_context_key = key
+    _last_prompt = assemble_system_prompt(context)
+
+    # 打印加载的 sections（调试信息）
+    loaded = ["identity", "workspace", "tools"]
+    if context.get("skills_catalog"):
+        loaded.append("skills")
+    if context.get("memory_index"):
+        loaded.append("memory")
+    print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
+
+    return _last_prompt
+
 
 # ── The core pattern: a while loop that calls tools until the model stops ──
 rounds_since_todo = 0
@@ -70,10 +196,13 @@ def agent_loop(messages: list):
     global rounds_since_todo
     reactive_retries = 0  # 跟踪 reactive_compact 重试次数
 
-    # ── s09: 加载相关记忆并构建 system ─────────────────
+    # ── s10: 初始化 context 并组装 system prompt ────────
+    context = update_context({}, messages)
+    system = get_system_prompt(context)
+
+    # ── s09: 加载相关记忆 ──────────────────────────────
     memories_content = load_memories(messages)
     memory_turn = len(messages) - 1 if messages and isinstance(messages[-1].get("content"), str) else None
-    system = build_system()  # 每轮重新构建，因为记忆索引可能更新
 
     while True:
         # ── s09: 保存压缩前快照（用于准确提取记忆）────────
@@ -214,6 +343,11 @@ def agent_loop(messages: list):
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
 
         messages.append({"role": "user", "content": results})
+
+        # ── s10: 重新评估 context 和 prompt ──────────────
+        # 工具执行后可能改变了状态（创建记忆、添加技能等）
+        context = update_context(context, messages)
+        system = get_system_prompt(context)
 
         # 如果执行了 compact，立即开始新一轮（用压缩后的上下文）
         if compacted:
