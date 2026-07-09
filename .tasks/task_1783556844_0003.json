@@ -1,0 +1,10 @@
+{
+  "id": "task_1783556844_0003",
+  "subject": "Write API endpoints",
+  "description": "Implement REST API",
+  "status": "completed",
+  "owner": "agent",
+  "blockedBy": [
+    "task_1783556844_0001"
+  ]
+}

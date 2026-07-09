@@ -44,6 +44,26 @@ from compact import (
 )
 
 import json
+import time
+import random
+import os
+
+# ── Error Recovery Constants (s11) ──────────────────────
+
+DEFAULT_MAX_TOKENS = 8000
+ESCALATED_MAX_TOKENS = 64000
+MAX_RETRIES = 10
+BASE_DELAY_MS = 500
+MAX_CONSECUTIVE_529 = 3
+MAX_RECOVERY_RETRIES = 3
+CONTINUATION_PROMPT = (
+    "Output token limit hit. Resume directly — no apology, no recap. "
+    "Pick up mid-thought."
+)
+
+# 备用模型（可选，从环境变量读取）
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL_ID", "")
+PRIMARY_MODEL = MODEL  # 保存原始模型
 
 # ── Prompt Sections ──────────────────────────────────────
 
@@ -188,13 +208,220 @@ def get_system_prompt(context: dict) -> str:
     return _last_prompt
 
 
+# ── Error Recovery (s11) ─────────────────────────────────
+
+class RecoveryState:
+    """
+    跟踪恢复尝试状态
+
+    属性说明：
+    - has_escalated: 是否已将 max_tokens 从 8K 升级到 64K（只升级一次）
+    - recovery_count: 输出截断续写的次数（最多 3 次）
+    - consecutive_529: 连续 529 错误的次数（达到 3 次切换备用模型）
+    - has_attempted_reactive_compact: 是否已尝试过应急压缩（只尝试一次）
+    - current_model: 当前使用的模型 ID（可能从 PRIMARY_MODEL 切换到 FALLBACK_MODEL）
+
+    业务逻辑：
+    - 每个 agent_loop 调用创建一个 RecoveryState 实例
+    - 在整个对话循环中保持状态，避免重复恢复动作
+    - has_escalated 和 has_attempted_reactive_compact 确保每种恢复只尝试一次
+    - recovery_count 和 consecutive_529 用于计数限制
+    - current_model 支持动态切换模型
+    """
+    def __init__(self):
+        self.has_escalated = False
+        self.recovery_count = 0
+        self.consecutive_529 = 0
+        self.has_attempted_reactive_compact = False
+        self.current_model = PRIMARY_MODEL
+
+
+def retry_delay(attempt: int, retry_after: int | None = None) -> float:
+    """
+    计算指数退避延迟（带随机抖动）
+
+    Args:
+        attempt: 重试次数（从 0 开始）
+        retry_after: 服务器返回的 Retry-After 值（秒），优先使用
+
+    Returns:
+        延迟秒数（浮点数）
+
+    业务逻辑：
+    1. 如果服务器返回 Retry-After header，直接使用该值
+    2. 否则使用指数退避公式：base = min(500 × 2^attempt, 32000) ms
+    3. 添加随机抖动：0 到 base 的 25%
+    4. 返回秒数（base + jitter）/ 1000
+
+    指数退避表：
+    - 尝试 0: 500ms + 0-125ms = 500-625ms
+    - 尝试 1: 1000ms + 0-250ms = 1000-1250ms
+    - 尝试 2: 2000ms + 0-500ms = 2000-2500ms
+    - 尝试 3: 4000ms + 0-1000ms = 4000-5000ms
+    - 尝试 4: 8000ms + 0-2000ms = 8000-10000ms
+    - 尝试 5: 16000ms + 0-4000ms = 16000-20000ms
+    - 尝试 6+: 32000ms + 0-8000ms = 32000-40000ms (上限)
+
+    为什么需要抖动：
+    - 避免并发请求在同一时刻重试（thundering herd problem）
+    - 分散重试流量，减少服务器压力
+    - 25% 的抖动范围是工程经验值
+    """
+    if retry_after:
+        return retry_after
+
+    # 指数退避：500 × 2^attempt，上限 32000 毫秒
+    base = min(BASE_DELAY_MS * (2 ** attempt), 32000) / 1000  # 转换为秒
+
+    # 随机抖动：0 到 base 的 25%
+    jitter = random.uniform(0, base * 0.25)
+
+    return base + jitter
+
+
+def is_prompt_too_long_error(e: Exception) -> bool:
+    """
+    检查异常是否为上下文超限错误
+
+    Args:
+        e: API 调用抛出的异常
+
+    Returns:
+        True 如果是上下文超限错误，False 否则
+
+    业务逻辑：
+    1. 将异常消息转换为小写字符串
+    2. 检查是否包含以下关键词组合：
+       - "prompt" + "long": prompt 太长
+       - "prompt_is_too_long": Claude API 的具体错误类型
+       - "context_length_exceeded": 超出上下文长度限制
+       - "max_context_window": 超出最大上下文窗口
+    3. 满足任一条件即判定为上下文超限错误
+
+    为什么需要多种模式匹配：
+    - 不同 API 版本可能返回不同的错误消息
+    - 不同云服务商（AWS Bedrock、GCP Vertex AI）可能用不同表述
+    - 错误消息可能变化，多种模式提高鲁棒性
+
+    与 compact.py 中 reactive_compact 的关系：
+    - 当前项目已有 reactive_compact 实现（在 compact.py 中）
+    - 本函数用于判断何时触发 reactive_compact
+    - 如果检测到上下文超限，agent_loop 会调用 reactive_compact
+    """
+    try:
+        msg = str(e).lower()
+    except:
+        msg = repr(e).lower()
+    return (("prompt" in msg and "long" in msg)
+            or "prompt_is_too_long" in msg
+            or "context_length_exceeded" in msg
+            or "max_context_window" in msg)
+
+
+def with_retry(fn, state: RecoveryState):
+    """
+    指数退避重试包装器，处理瞬态错误（429 限流、529 过载）
+
+    Args:
+        fn: 要执行的函数（通常是 lambda: client.messages.create(...)）
+        state: RecoveryState 实例，跟踪连续 529 错误和当前模型
+
+    Returns:
+        fn() 的返回值（成功时）
+
+    Raises:
+        RuntimeError: 超过最大重试次数
+        Exception: 非瞬态错误直接抛出给外层处理
+
+    业务逻辑：
+    1. 尝试执行 fn()，最多 MAX_RETRIES 次（10 次）
+    2. 成功时：重置 consecutive_529 计数器，返回结果
+    3. 遇到 429 错误：
+       - 打印重试信息
+       - 使用 retry_delay() 计算延迟
+       - sleep 后继续重试
+    4. 遇到 529 错误：
+       - consecutive_529 计数器 +1
+       - 如果连续 3 次 529 且配置了 FALLBACK_MODEL：
+         * 切换到 FALLBACK_MODEL
+         * 重置 consecutive_529 计数器
+         * 打印模型切换信息
+       - 使用 retry_delay() 计算延迟
+       - sleep 后继续重试
+    5. 遇到其他错误：直接 raise 给外层 try/except 处理
+    6. 超过最大重试次数：raise RuntimeError
+
+    为什么 429 和 529 是瞬态错误：
+    - 429 Rate Limit：请求频率太高，等待后可恢复
+    - 529 Overloaded：服务器过载，等待后可恢复
+    - 其他错误（如 prompt_too_long）不是瞬态的，需要改变请求本身
+
+    为什么需要 consecutive_529 计数：
+    - 偶尔一次 529 是正常的（流量波动）
+    - 连续 3 次 529 说明主模型持续过载，需要切换到备用模型
+    - 切换后重置计数，因为新模型可能有独立的容量
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            result = fn()
+            # 成功：重置 529 计数器
+            state.consecutive_529 = 0
+            return result
+        except Exception as e:
+            name = type(e).__name__
+            try:
+                msg = str(e).lower()
+            except:
+                msg = repr(e).lower()
+
+            # 429 限流错误 -> 指数退避
+            if "ratelimit" in name.lower() or "429" in msg:
+                delay = retry_delay(attempt)
+                print(f"  \033[33m[429 rate limit] retry {attempt+1}/{MAX_RETRIES},"
+                      f" wait {delay:.1f}s\033[0m")
+                time.sleep(delay)
+                continue
+
+            # 529 过载错误 -> 指数退避 + 可能切换模型
+            if "overloaded" in name.lower() or "529" in msg or "overloaded" in msg:
+                state.consecutive_529 += 1
+
+                # 连续 3 次 529 -> 切换备用模型
+                if state.consecutive_529 >= MAX_CONSECUTIVE_529:
+                    if FALLBACK_MODEL:
+                        state.current_model = FALLBACK_MODEL
+                        state.consecutive_529 = 0
+                        print(f"  \033[31m[529 x{MAX_CONSECUTIVE_529}]"
+                              f" switching to {FALLBACK_MODEL}\033[0m")
+                    else:
+                        # 没有配置备用模型，重置计数继续重试
+                        state.consecutive_529 = 0
+                        print(f"  \033[31m[529 x{MAX_CONSECUTIVE_529}]"
+                              f" no FALLBACK_MODEL_ID configured, continuing retry\033[0m")
+
+                delay = retry_delay(attempt)
+                print(f"  \033[33m[529 overloaded] retry {attempt+1}/{MAX_RETRIES},"
+                      f" wait {delay:.1f}s\033[0m")
+                time.sleep(delay)
+                continue
+
+            # 非瞬态错误 -> 直接抛出给外层处理
+            raise
+
+    # 超过最大重试次数
+    raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded")
+
+
 # ── The core pattern: a while loop that calls tools until the model stops ──
 rounds_since_todo = 0
 
 
 def agent_loop(messages: list):
     global rounds_since_todo
-    reactive_retries = 0  # 跟踪 reactive_compact 重试次数
+
+    # ── s11: 创建恢复状态和初始 max_tokens ─────────────
+    state = RecoveryState()
+    max_tokens = DEFAULT_MAX_TOKENS
 
     # ── s10: 初始化 context 并组装 system prompt ────────
     context = update_context({}, messages)
@@ -227,40 +454,92 @@ def agent_loop(messages: list):
                              "content": "<reminder>Update your todos.</reminder>"})
             rounds_since_todo = 0
 
-        # ── LLM 调用（带应急压缩重试） ────────────────────────
+        # ── s11: LLM 调用（with_retry 处理 429/529） ─────────
         try:
             # s09: 如果有记忆，临时注入到请求中
             request_messages = messages
             if memories_content and memory_turn is not None and memory_turn < len(messages):
                 request_messages = messages.copy()
+                original_content = messages[memory_turn]["content"]
+
+                # 安全处理 content：可能是字符串或列表
+                if isinstance(original_content, str):
+                    # content 是字符串，直接拼接
+                    new_content = memories_content + "\n\n" + original_content
+                elif isinstance(original_content, list):
+                    # content 是列表（工具结果），将记忆作为第一个文本块
+                    new_content = [{"type": "text", "text": memories_content}] + original_content
+                else:
+                    # 其他情况，保持原样（不注入记忆）
+                    new_content = original_content
+
                 request_messages[memory_turn] = {
                     **messages[memory_turn],
-                    "content": memories_content + "\n\n" + messages[memory_turn]["content"],
+                    "content": new_content,
                 }
 
-            response = client.messages.create(
-                model=MODEL, system=system, messages=request_messages,
-                tools=TOOLS, max_tokens=8000,
+            # with_retry 处理瞬态错误（429/529）
+            response = with_retry(
+                lambda: client.messages.create(
+                    model=state.current_model,  # 使用 state 中的模型（可能切换）
+                    system=system,
+                    messages=request_messages,
+                    tools=TOOLS,
+                    max_tokens=max_tokens,  # 使用变量（可能升级）
+                ),
+                state
             )
-            reactive_retries = 0  # 成功后重置
 
         except Exception as e:
-            # 检查是否是 prompt_too_long 错误
-            error_message = str(e).lower()
-            if "prompt" in error_message and ("too long" in error_message or "too large" in error_message or "413" in error_message):
-                if reactive_retries < MAX_REACTIVE_RETRIES:
+            # ── 路径 2: prompt_too_long -> reactive compact (一次) ──
+            if is_prompt_too_long_error(e):
+                if not state.has_attempted_reactive_compact:
                     messages[:] = reactive_compact(messages)
-                    reactive_retries += 1
+                    state.has_attempted_reactive_compact = True
                     continue  # 重试
-                else:
-                    print(f"\033[31m[ERROR] Reactive compact 重试次数超限，停止\033[0m")
-                    raise
-            else:
-                # 其他错误直接抛出
-                raise
+                # 压缩后还是超限，无法恢复
+                print("  \033[31m[unrecoverable] still too long after compact\033[0m")
+                messages.append({"role": "assistant", "content": [
+                    {"type": "text",
+                     "text": "[Error] Context too large, cannot continue."}]})
+                return
 
-        # ── 处理响应 ──────────────────────────────────────────
+            # ── 其他不可恢复错误 ──────────────────────────────
+            name = type(e).__name__
+            try:
+                error_msg = str(e)
+            except:
+                error_msg = repr(e)
+            print(f"  \033[31m[unrecoverable] {name}: {error_msg[:100]}\033[0m")
+            messages.append({"role": "assistant", "content": [
+                {"type": "text", "text": f"[Error] {name}: {error_msg[:200]}"}]})
+            return
+
+        # ── 路径 1: max_tokens -> 升级或续写 ──────────────────
+        if response.stop_reason == "max_tokens":
+            # 第一次截断：升级到 64K，不追加截断内容，重试相同请求
+            if not state.has_escalated:
+                max_tokens = ESCALATED_MAX_TOKENS
+                state.has_escalated = True
+                print(f"  \033[33m[max_tokens] escalating"
+                      f" {DEFAULT_MAX_TOKENS} -> {ESCALATED_MAX_TOKENS}\033[0m")
+                continue  # messages 不变，用更大 max_tokens 重试
+
+            # 64K 还是截断：保存截断内容 + 续写提示
+            messages.append({"role": "assistant", "content": response.content})
+            if state.recovery_count < MAX_RECOVERY_RETRIES:
+                messages.append({"role": "user", "content": CONTINUATION_PROMPT})
+                state.recovery_count += 1
+                print(f"  \033[33m[max_tokens] continuation"
+                      f" {state.recovery_count}/{MAX_RECOVERY_RETRIES}\033[0m")
+                continue
+            # 续写 3 次后还是截断，放弃
+            print("  \033[31m[max_tokens] recovery limit reached\033[0m")
+            return
+
+        # ── 正常完成：追加响应 ────────────────────────────────
         messages.append({"role": "assistant", "content": response.content})
+
         if response.stop_reason != "tool_use":
             # s09: 从压缩前快照提取记忆
             extract_memories(pre_compress)

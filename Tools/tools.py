@@ -26,6 +26,16 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {}, "required": []}},
     {"name": "debug_messages", "description": "Show current message count and recent message info for debugging compact feature.",
      "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "create_task", "description": "Create a new task with optional blockedBy dependencies.",
+     "input_schema": {"type": "object", "properties": {"subject": {"type": "string", "description": "Task title"}, "description": {"type": "string", "description": "Detailed description (optional)"}, "blockedBy": {"type": "array", "items": {"type": "string"}, "description": "List of task IDs that must be completed first (optional)"}}, "required": ["subject"]}},
+    {"name": "list_tasks", "description": "List all tasks with their status, owner, and dependencies.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "get_task", "description": "Get full details of a specific task by ID.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "string", "description": "Task ID"}}, "required": ["task_id"]}},
+    {"name": "claim_task", "description": "Claim a pending task. Sets owner and changes status to in_progress.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "string", "description": "Task ID to claim"}}, "required": ["task_id"]}},
+    {"name": "complete_task", "description": "Complete an in-progress task. Reports unblocked downstream tasks.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "string", "description": "Task ID to complete"}}, "required": ["task_id"]}},
 ]
 
 
@@ -154,8 +164,88 @@ def run_compact() -> str:
     return "[Compact requested. History will be summarized.]"
 
 
+def run_load_skill(name: str) -> str:
+    """
+    Load skill 工具的处理函数
+
+    Args:
+        name: 技能名称
+
+    Returns:
+        技能的完整内容
+
+    业务逻辑：
+    - 从 skill_using 模块导入 load_skill 函数
+    - 返回技能的完整内容，供 LLM 使用
+    """
+    from skill_using import load_skill
+    return load_skill(name)
+
+
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write,
-    "compact": run_compact,
+    "compact": run_compact, "load_skill": run_load_skill,
 }
+
+
+# ── Task tool implementations ────────────────────────────
+def run_create_task(subject: str, description: str = "", blockedBy: list[str] | None = None) -> str:
+    """创建任务的工具处理函数"""
+    from tasks import create_task
+    task = create_task(subject, description, blockedBy)
+    deps = f" (blockedBy: {', '.join(blockedBy)})" if blockedBy else ""
+    print(f"  \033[34m[create] {task.subject}{deps}\033[0m")
+    return f"Created {task.id}: {task.subject}{deps}"
+
+
+def run_list_tasks() -> str:
+    """列出所有任务的工具处理函数"""
+    from tasks import list_tasks
+    tasks = list_tasks()
+    if not tasks:
+        return "No tasks. Use create_task to add some."
+    lines = []
+    for t in tasks:
+        icon = {"pending": "○", "in_progress": "●", "completed": "✓"}.get(t.status, "?")
+        deps = f" (blockedBy: {', '.join(t.blockedBy)})" if t.blockedBy else ""
+        owner = f" [{t.owner}]" if t.owner else ""
+        lines.append(f"  {icon} {t.id}: {t.subject} [{t.status}]{owner}{deps}")
+    return "\n".join(lines)
+
+
+def run_get_task(task_id: str) -> str:
+    """获取任务详情的工具处理函数"""
+    from tasks import get_task
+    try:
+        return get_task(task_id)
+    except FileNotFoundError:
+        return f"Error: Task {task_id} not found"
+
+
+def run_claim_task(task_id: str) -> str:
+    """认领任务的工具处理函数"""
+    from tasks import claim_task
+    try:
+        return claim_task(task_id, owner="agent")
+    except FileNotFoundError:
+        return f"Error: Task {task_id} not found"
+
+
+def run_complete_task(task_id: str) -> str:
+    """完成任务的工具处理函数"""
+    from tasks import complete_task
+    try:
+        return complete_task(task_id)
+    except FileNotFoundError:
+        return f"Error: Task {task_id} not found"
+
+
+# 更新 TOOL_HANDLERS 添加任务工具
+TOOL_HANDLERS.update({
+    "create_task": run_create_task,
+    "list_tasks": run_list_tasks,
+    "get_task": run_get_task,
+    "claim_task": run_claim_task,
+    "complete_task": run_complete_task,
+})

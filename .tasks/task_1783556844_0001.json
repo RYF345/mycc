@@ -1,0 +1,8 @@
+{
+  "id": "task_1783556844_0001",
+  "subject": "Setup database schema",
+  "description": "Create users and posts tables",
+  "status": "completed",
+  "owner": "test-agent",
+  "blockedBy": []
+}

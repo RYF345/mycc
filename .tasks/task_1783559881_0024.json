@@ -1,0 +1,10 @@
+{
+  "id": "task_1783559881_0024",
+  "subject": "Create API endpoints",
+  "description": "Develop API endpoints for the application",
+  "status": "completed",
+  "owner": "agent",
+  "blockedBy": [
+    "task_1783559879_0023"
+  ]
+}

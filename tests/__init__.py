@@ -1,1 +1,1 @@
-# Tests package
+"""Tests package for my_agent project."""

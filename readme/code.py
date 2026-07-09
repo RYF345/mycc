@@ -1,31 +1,28 @@
 #!/usr/bin/env python3
 """
-s09_memory.py - Memory System
+s12: Task System — file-persisted task graph with blockedBy dependencies.
 
-Persistent, cross-session knowledge for the coding agent.
+Run:  python s12_task_system/code.py
+Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
 
-Storage:
-    .memory/
-      MEMORY.md          ← index (one line per memory, ≤200 lines)
-      feedback_tabs.md    ← individual memory files (Markdown + YAML frontmatter)
-      user_profile.md
-      project_facts.md
+Changes from s11:
+  - Task dataclass (id, subject, description, status, owner, blockedBy)
+  - TASKS_DIR = .tasks/ for persistent JSON storage
+  - create_task / save_task / load_task / list_tasks / get_task
+  - can_start: checks blockedBy all completed (missing deps = blocked)
+  - claim_task: set owner + pending -> in_progress
+  - complete_task: set completed + report unblocked downstream
+  - 5 new tools: create_task, list_tasks, get_task, claim_task, complete_task
 
-Flow in agent_loop:
-    1. Load MEMORY.md index into SYSTEM prompt (cheap, always present)
-    2. Select relevant memories by filename/description → inject content
-    3. Run compression pipeline from s08
-    4. After each turn ends → extract new memories from original messages
-    5. Periodically consolidate (Dream)
-
-Builds on s08 (context compact). Usage:
-
-    python s09_memory/code.py
-    Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
+Note: Teaching code keeps a basic agent loop to stay focused on the task
+system. S11's full error recovery (RecoveryState, backoff, escalation,
+reactive compact, fallback model) is omitted — in real CC, tasks.ts and
+withRetry are independent layers that compose naturally.
 """
 
-import os, subprocess, json, time, re
+import os, subprocess, json, time, random
 from pathlib import Path
+from dataclasses import dataclass, asdict
 
 try:
     import readline
@@ -37,619 +34,343 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"): os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+if os.getenv("ANTHROPIC_BASE_URL"):
+    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-MEMORY_DIR = WORKDIR / ".memory"; MEMORY_DIR.mkdir(exist_ok=True)
+MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
-SKILLS_DIR = WORKDIR / "skills"
-TRANSCRIPT_DIR = WORKDIR / ".transcripts"
-TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
+# ── Task System ──
 
-# ═══════════════════════════════════════════════════════════
-#  NEW in s09: Memory System
-# ═══════════════════════════════════════════════════════════
-
-MEMORY_TYPES = ["user", "feedback", "project", "reference"]
-
-def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    if not text.startswith("---"):
-        return {}, text
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return {}, text
-    meta = {}
-    for line in parts[1].strip().splitlines():
-        if ":" in line:
-            k, v = line.split(":", 1)
-            meta[k.strip()] = v.strip().strip('"').strip("'")
-    return meta, parts[2].strip()
+TASKS_DIR = WORKDIR / ".tasks"
+TASKS_DIR.mkdir(exist_ok=True)
 
 
-def write_memory_file(name: str, mem_type: str, description: str, body: str):
-    """Write a single memory file with YAML frontmatter."""
-    slug = name.lower().replace(" ", "-").replace("/", "-")
-    filename = f"{slug}.md"
-    filepath = MEMORY_DIR / filename
-    filepath.write_text(
-        f"---\nname: {name}\ndescription: {description}\ntype: {mem_type}\n---\n\n{body}\n"
+@dataclass
+class Task:
+    id: str
+    subject: str
+    description: str
+    status: str          # pending | in_progress | completed
+    owner: str | None    # Agent name (multi-agent scenarios)
+    blockedBy: list[str] # Dependency task IDs
+
+
+def _task_path(task_id: str) -> Path:
+    return TASKS_DIR / f"{task_id}.json"
+
+
+def create_task(subject: str, description: str = "",
+                blockedBy: list[str] | None = None) -> Task:
+    task = Task(
+        id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
+        subject=subject,
+        description=description,
+        status="pending",
+        owner=None,
+        blockedBy=blockedBy or [],
     )
-    _rebuild_index()
-    return filepath
+    save_task(task)
+    return task
 
 
-def _rebuild_index():
-    """Rebuild MEMORY.md index from all memory files."""
-    lines = []
-    for f in sorted(MEMORY_DIR.glob("*.md")):
-        if f.name == "MEMORY.md":
-            continue
-        raw = f.read_text()
-        meta, body = _parse_frontmatter(raw)
-        name = meta.get("name", f.stem)
-        desc = meta.get("description", body.split("\n")[0][:80])
-        lines.append(f"- [{name}]({f.name}) — {desc}")
-    MEMORY_INDEX.write_text("\n".join(lines) + "\n" if lines else "")
+def save_task(task: Task):
+    _task_path(task.id).write_text(json.dumps(asdict(task), indent=2))
 
 
-def read_memory_index() -> str:
-    """Read MEMORY.md index (injected into SYSTEM every turn)."""
-    if not MEMORY_INDEX.exists():
-        return ""
-    text = MEMORY_INDEX.read_text().strip()
-    return text if text else ""
+def load_task(task_id: str) -> Task:
+    return Task(**json.loads(_task_path(task_id).read_text()))
 
 
-def read_memory_file(filename: str) -> str | None:
-    """Read a single memory file's full content."""
-    path = MEMORY_DIR / filename
-    if not path.exists():
-        return None
-    return path.read_text()
+def list_tasks() -> list[Task]:
+    return [Task(**json.loads(p.read_text()))
+            for p in sorted(TASKS_DIR.glob("task_*.json"))]
 
 
-def list_memory_files() -> list[dict]:
-    """List all memory files with metadata."""
-    result = []
-    for f in sorted(MEMORY_DIR.glob("*.md")):
-        if f.name == "MEMORY.md":
-            continue
-        raw = f.read_text()
-        meta, body = _parse_frontmatter(raw)
-        result.append({
-            "filename": f.name,
-            "name": meta.get("name", f.stem),
-            "description": meta.get("description", ""),
-            "type": meta.get("type", "user"),
-            "body": body,
-        })
-    return result
+def get_task(task_id: str) -> str:
+    """Return full task details as JSON."""
+    task = load_task(task_id)
+    return json.dumps(asdict(task), indent=2)
 
 
-def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
-    """Select relevant memory filenames by matching recent conversation against
-    memory names/descriptions. Uses a simple LLM call (or falls back to keyword
-    matching on name+description)."""
-    files = list_memory_files()
-    if not files:
-        return []
-
-    # Collect recent user text for context
-    recent_texts = []
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                content = " ".join(
-                    str(getattr(b, "text", "")) for b in content
-                    if getattr(b, "type", None) == "text"
-                )
-            if isinstance(content, str):
-                recent_texts.append(content)
-            if len(recent_texts) >= 3:
-                break
-    recent = " ".join(reversed(recent_texts))[:2000]
-
-    if not recent.strip():
-        return []
-
-    # Build catalog of name + description for LLM to choose from
-    catalog_lines = []
-    for i, f in enumerate(files):
-        catalog_lines.append(f"{i}: {f['name']} — {f['description']}")
-    catalog = "\n".join(catalog_lines)
-
-    prompt = (
-        "Given the recent conversation and the memory catalog below, "
-        "select the indices of memories that are clearly relevant. "
-        "Return ONLY a JSON array of integers, e.g. [0, 3]. "
-        "If none are relevant, return [].\n\n"
-        f"Recent conversation:\n{recent}\n\n"
-        f"Memory catalog:\n{catalog}"
-    )
-
-    try:
-        response = client.messages.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
-        )
-        text = extract_text(response.content).strip()
-        # Extract JSON array from response
-        match = re.search(r'\[.*?\]', text, re.DOTALL)
-        if match:
-            indices = json.loads(match.group())
-            selected = []
-            for idx in indices:
-                if isinstance(idx, int) and 0 <= idx < len(files):
-                    selected.append(files[idx]["filename"])
-                    if len(selected) >= max_items:
-                        break
-            return selected
-    except Exception:
-        pass
-
-    # Fallback: keyword matching on name + description
-    keywords = [w.lower() for w in recent.split() if len(w) > 3]
-    selected = []
-    for f in files:
-        text = (f["name"] + " " + f["description"]).lower()
-        if any(kw in text for kw in keywords):
-            selected.append(f["filename"])
-            if len(selected) >= max_items:
-                break
-    return selected
+def can_start(task_id: str) -> bool:
+    """Check if all blockedBy dependencies are completed.
+    Missing dependencies are treated as blocked."""
+    task = load_task(task_id)
+    for dep_id in task.blockedBy:
+        if not _task_path(dep_id).exists():
+            return False
+        if load_task(dep_id).status != "completed":
+            return False
+    return True
 
 
-def load_memories(messages: list) -> str:
-    """Load relevant memory content for injection into context."""
-    selected_files = select_relevant_memories(messages)
-    if not selected_files:
-        return ""
-
-    parts = ["<relevant_memories>"]
-    for filename in selected_files:
-        content = read_memory_file(filename)
-        if content:
-            parts.append(content)
-    parts.append("</relevant_memories>")
-    return "\n\n".join(parts)
-
-
-def extract_memories(messages: list):
-    """Extract new memories from recent dialogue. Runs after each turn."""
-    # Collect recent conversation text
-    dialogue_parts = []
-    for msg in messages[-10:]:
-        role = msg.get("role", "?")
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            content = " ".join(
-                str(getattr(b, "text", "")) for b in content
-                if getattr(b, "type", None) == "text"
-            )
-        if isinstance(content, str) and content.strip():
-            dialogue_parts.append(f"{role}: {content}")
-    dialogue = "\n".join(dialogue_parts)
-
-    if not dialogue.strip():
-        return
-
-    # Check existing memories to avoid duplicates
-    existing = list_memory_files()
-    existing_desc = "\n".join(f"- {m['name']}: {m['description']}" for m in existing) if existing else "(none)"
-
-    prompt = (
-        "Extract user preferences, constraints, or project facts from this dialogue.\n"
-        "Return a JSON array. Each item: {name, type, description, body}.\n"
-        "- name: short kebab-case identifier (e.g. 'user-preference-tabs')\n"
-        "- type: one of 'user' (user preference), 'feedback' (guidance), "
-        "'project' (project fact), 'reference' (external pointer)\n"
-        "- description: one-line summary for index lookup\n"
-        "- body: full detail in markdown\n"
-        "If nothing new or already covered by existing memories, return [].\n\n"
-        f"Existing memories:\n{existing_desc}\n\n"
-        f"Dialogue:\n{dialogue[:4000]}"
-    )
-
-    try:
-        response = client.messages.create(
-            model=MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=800
-        )
-        text = extract_text(response.content).strip()
-        # Extract JSON array from response
-        match = re.search(r'\[.*\]', text, re.DOTALL)
-        if not match:
-            return
-        items = json.loads(match.group())
-        if not items:
-            return
-        count = 0
-        for mem in items:
-            name = mem.get("name", f"memory_{int(time.time())}")
-            mem_type = mem.get("type", "user")
-            desc = mem.get("description", "")
-            body = mem.get("body", "")
-            if desc and body:
-                write_memory_file(name, mem_type, desc, body)
-                count += 1
-        if count:
-            print(f"\n\033[33m[Memory: extracted {count} new memories]\033[0m")
-    except Exception:
-        pass
+def claim_task(task_id: str, owner: str = "agent") -> str:
+    task = load_task(task_id)
+    if task.status != "pending":
+        return f"Task {task_id} is {task.status}, cannot claim"
+    if not can_start(task_id):
+        deps = [d for d in task.blockedBy
+                if not _task_path(d).exists() or load_task(d).status != "completed"]
+        return f"Blocked by: {deps}"
+    task.owner = owner
+    task.status = "in_progress"
+    save_task(task)
+    print(f"  \033[36m[claim] {task.subject} → in_progress (owner: {owner})\033[0m")
+    return f"Claimed {task.id} ({task.subject})"
 
 
-CONSOLIDATE_THRESHOLD = 10
-
-def consolidate_memories():
-    """Merge duplicate/stale memories. Triggered when file count ≥ threshold."""
-    files = list_memory_files()
-    if len(files) < CONSOLIDATE_THRESHOLD:
-        return
-
-    catalog = "\n\n".join(
-        f"## {f['filename']}\nname: {f['name']}\ndescription: {f['description']}\n{f['body']}"
-        for f in files
-    )
-
-    prompt = (
-        "Consolidate the following memory files. Rules:\n"
-        "1. Merge duplicates into one\n"
-        "2. Remove outdated/contradicted memories\n"
-        "3. Keep the total under 30 memories\n"
-        "4. Preserve important user preferences above all\n"
-        "Return a JSON array. Each item: {name, type, description, body}.\n\n"
-        f"{catalog[:16000]}"
-    )
-
-    try:
-        response = client.messages.create(
-            model=MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=3000
-        )
-        text = extract_text(response.content).strip()
-        match = re.search(r'\[.*\]', text, re.DOTALL)
-        if not match:
-            return
-        items = json.loads(match.group())
-
-        # Remove old memory files (keep MEMORY.md)
-        for f in MEMORY_DIR.glob("*.md"):
-            if f.name != "MEMORY.md":
-                f.unlink()
-
-        for mem in items:
-            name = mem.get("name", f"memory_{int(time.time())}")
-            mem_type = mem.get("type", "user")
-            desc = mem.get("description", "")
-            body = mem.get("body", "")
-            if desc and body:
-                write_memory_file(name, mem_type, desc, body)
-
-        print(f"\n\033[33m[Memory: consolidated {len(files)} → {len(items)} memories]\033[0m")
-    except Exception:
-        pass
+def complete_task(task_id: str) -> str:
+    task = load_task(task_id)
+    if task.status != "in_progress":
+        return f"Task {task_id} is {task.status}, cannot complete"
+    task.status = "completed"
+    save_task(task)
+    unblocked = [t.subject for t in list_tasks()
+                 if t.status == "pending" and t.blockedBy and can_start(t.id)]
+    print(f"  \033[32m[complete] {task.subject} ✓\033[0m")
+    msg = f"Completed {task.id} ({task.subject})"
+    if unblocked:
+        msg += f"\nUnblocked: {', '.join(unblocked)}"
+        print(f"  \033[33m[unblocked] {', '.join(unblocked)}\033[0m")
+    return msg
 
 
-# Build SYSTEM with memory index
-def build_system() -> str:
-    index = read_memory_index()
-    memories_section = f"\n\nMemories available:\n{index}" if index else ""
-    return (
-        f"You are a coding agent at {WORKDIR}."
-        f"{memories_section}\n"
-        "Relevant memories are injected below. Respect user preferences from memory.\n"
-        "When the user says 'remember' or expresses a clear preference, extract it as a memory."
-    )
+# ── Prompt Assembly (from s10, synced) ──
 
-SUB_SYSTEM = (
-    f"You are a coding agent at {WORKDIR}. "
-    "Complete the task you were given, then return a concise summary. "
-    "Do not delegate further."
-)
+PROMPT_SECTIONS = {
+    "identity": "You are a coding agent. Act, don't explain.",
+    "tools": "Available tools: bash, read_file, write_file, "
+             "create_task, list_tasks, get_task, claim_task, complete_task.",
+    "workspace": f"Working directory: {WORKDIR}",
+    "memory": "Relevant memories are injected below when available.",
+}
 
 
-# ═══════════════════════════════════════════════════════════
-#  FROM s02-s08 (skeleton): Basic tools
-# ═══════════════════════════════════════════════════════════
+def assemble_system_prompt(context: dict) -> str:
+    sections = [PROMPT_SECTIONS["identity"],
+                PROMPT_SECTIONS["tools"],
+                PROMPT_SECTIONS["workspace"]]
+    memories = context.get("memories", "")
+    if memories:
+        sections.append(f"Relevant memories:\n{memories}")
+    return "\n\n".join(sections)
+
+
+_last_context_key, _last_prompt = None, None
+
+
+def get_system_prompt(context: dict) -> str:
+    global _last_context_key, _last_prompt
+    key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
+    if key == _last_context_key and _last_prompt:
+        return _last_prompt
+    _last_context_key = key
+    _last_prompt = assemble_system_prompt(context)
+    return _last_prompt
+
+
+# ── Tools ──
 
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR): raise ValueError(f"Path escapes workspace: {p}")
+    if not path.is_relative_to(WORKDIR):
+        raise ValueError(f"Path escapes workspace: {p}")
     return path
+
 
 def run_bash(command: str) -> str:
     try:
-        r = subprocess.run(command, shell=True, cwd=WORKDIR, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(command, shell=True, cwd=WORKDIR,
+                           capture_output=True, text=True, timeout=120)
         out = (r.stdout + r.stderr).strip()
         return out[:50000] if out else "(no output)"
-    except subprocess.TimeoutExpired: return "Error: Timeout (120s)"
+    except subprocess.TimeoutExpired:
+        return "Error: Timeout (120s)"
+
 
 def run_read(path: str, limit: int | None = None) -> str:
     try:
         lines = safe_path(path).read_text().splitlines()
-        if limit and limit < len(lines): lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+        if limit and limit < len(lines):
+            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)
-    except Exception as e: return f"Error: {e}"
+    except Exception as e:
+        return f"Error: {e}"
+
 
 def run_write(path: str, content: str) -> str:
     try:
-        file_path = safe_path(path); file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content); return f"Wrote {len(content)} bytes to {path}"
-    except Exception as e: return f"Error: {e}"
+        fp = safe_path(path)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(content)
+        return f"Wrote {len(content)} bytes to {path}"
+    except Exception as e:
+        return f"Error: {e}"
 
-def run_edit(path: str, old_text: str, new_text: str) -> str:
+
+# Task tools
+
+def run_create_task(subject: str, description: str = "",
+                    blockedBy: list[str] | None = None) -> str:
+    task = create_task(subject, description, blockedBy)
+    deps = f" (blockedBy: {', '.join(blockedBy)})" if blockedBy else ""
+    print(f"  \033[34m[create] {task.subject}{deps}\033[0m")
+    return f"Created {task.id}: {task.subject}{deps}"
+
+
+def run_list_tasks() -> str:
+    tasks = list_tasks()
+    if not tasks:
+        return "No tasks. Use create_task to add some."
+    lines = []
+    for t in tasks:
+        icon = {"pending": "○", "in_progress": "●",
+                "completed": "✓"}.get(t.status, "?")
+        deps = f" (blockedBy: {', '.join(t.blockedBy)})" if t.blockedBy else ""
+        owner = f" [{t.owner}]" if t.owner else ""
+        lines.append(f"  {icon} {t.id}: {t.subject} "
+                     f"[{t.status}]{owner}{deps}")
+    return "\n".join(lines)
+
+
+def run_get_task(task_id: str) -> str:
     try:
-        file_path = safe_path(path)
-        text = file_path.read_text()
-        if old_text not in text: return f"Error: text not found in {path}"
-        file_path.write_text(text.replace(old_text, new_text, 1))
-        return f"Edited {path}"
-    except Exception as e: return f"Error: {e}"
-
-def run_glob(pattern: str) -> str:
-    import glob as g
-    try:
-        results = []
-        for match in g.glob(pattern, root_dir=WORKDIR):
-            if (WORKDIR / match).resolve().is_relative_to(WORKDIR):
-                results.append(match)
-        return "\n".join(results) if results else "(no matches)"
-    except Exception as e: return f"Error: {e}"
-
-def extract_text(content) -> str:
-    if not isinstance(content, list): return str(content)
-    return "\n".join(getattr(b, "text", "") for b in content if getattr(b, "type", None) == "text")
-
-# Subagent (simplified from s06-s07)
-SUB_TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-]
-SUB_HANDLERS = {"bash": run_bash, "read_file": run_read, "write_file": run_write}
-
-def spawn_subagent(task: str) -> str:
-    print(f"\n\033[35m[Subagent spawned]\033[0m")
-    messages = [{"role": "user", "content": task}]
-    for _ in range(30):
-        response = client.messages.create(model=MODEL, system=SUB_SYSTEM,
-            messages=messages, tools=SUB_TOOLS, max_tokens=8000)
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use": break
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = SUB_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown: {block.name}"
-                print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
-        messages.append({"role": "user", "content": results})
-    result = extract_text(messages[-1]["content"])
-    if not result:
-        for msg in reversed(messages):
-            if msg["role"] == "assistant":
-                result = extract_text(msg["content"])
-                if result: break
-        if not result: result = "Subagent stopped after 30 turns without final answer."
-    print(f"\033[35m[Subagent done]\033[0m")
-    return result
+        return get_task(task_id)
+    except FileNotFoundError:
+        return f"Error: Task {task_id} not found"
 
 
-# ═══════════════════════════════════════════════════════════
-#  FROM s08 (skeleton): Compaction pipeline
-# ═══════════════════════════════════════════════════════════
-
-CONTEXT_LIMIT = 50000; KEEP_RECENT = 3; PERSIST_THRESHOLD = 30000
-
-def estimate_size(msgs): return len(str(msgs))
-
-def _block_type(block):
-    return block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
-
-def _message_has_tool_use(msg):
-    if msg.get("role") != "assistant":
-        return False
-    content = msg.get("content")
-    if not isinstance(content, list):
-        return False
-    return any(_block_type(block) == "tool_use" for block in content)
-
-def _is_tool_result_message(msg):
-    if msg.get("role") != "user":
-        return False
-    content = msg.get("content")
-    if not isinstance(content, list):
-        return False
-    return any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content)
-
-def snip_compact(msgs, mx=50):
-    if len(msgs) <= mx: return msgs
-    head_end, tail_start = 3, len(msgs) - (mx - 3)
-    if head_end > 0 and _message_has_tool_use(msgs[head_end - 1]):
-        while head_end < len(msgs) and _is_tool_result_message(msgs[head_end]):
-            head_end += 1
-    if (tail_start > 0 and tail_start < len(msgs)
-            and _is_tool_result_message(msgs[tail_start])
-            and _message_has_tool_use(msgs[tail_start - 1])):
-        tail_start -= 1
-    if head_end >= tail_start:
-        return msgs
-    return msgs[:head_end] + [{"role": "user", "content": f"[snipped {tail_start - head_end} msgs]"}] + msgs[tail_start:]
-
-def collect_tool_results(msgs):
-    blocks = []
-    for mi, msg in enumerate(msgs):
-        if msg.get("role") != "user" or not isinstance(msg.get("content"), list): continue
-        for bi, block in enumerate(msg["content"]):
-            if isinstance(block, dict) and block.get("type") == "tool_result": blocks.append((mi, bi, block))
-    return blocks
-
-def micro_compact(msgs):
-    tr = collect_tool_results(msgs)
-    if len(tr) <= KEEP_RECENT: return msgs
-    for _, _, b in tr[:-KEEP_RECENT]:
-        if len(b.get("content", "")) > 120: b["content"] = "[Earlier tool result compacted.]"
-    return msgs
-
-def persist_large(tid, out):
-    if len(out) <= PERSIST_THRESHOLD: return out
-    TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    p = TOOL_RESULTS_DIR / f"{tid}.txt"
-    if not p.exists(): p.write_text(out)
-    return f"<persisted-output>\nFull: {p}\nPreview:\n{out[:2000]}\n</persisted-output>"
-
-def tool_result_budget(msgs, mx=200_000):
-    last = msgs[-1] if msgs else None
-    if not last or last.get("role") != "user" or not isinstance(last.get("content"), list): return msgs
-    blocks = [(i, b) for i, b in enumerate(last["content"]) if isinstance(b, dict) and b.get("type") == "tool_result"]
-    total = sum(len(str(b.get("content", ""))) for _, b in blocks)
-    if total <= mx: return msgs
-    for _, block in sorted(blocks, key=lambda p: len(str(p[1].get("content", ""))), reverse=True):
-        if total <= mx: break
-        c = str(block.get("content", ""))
-        if len(c) <= PERSIST_THRESHOLD: continue
-        block["content"] = persist_large(block.get("tool_use_id", "?"), c)
-        total = sum(len(str(b.get("content", ""))) for _, b in blocks)
-    return msgs
-
-def write_transcript(msgs):
-    TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
-    p = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with p.open("w") as f:
-        for m in msgs: f.write(json.dumps(m, default=str) + "\n")
-    return p
-
-def summarize_history(msgs):
-    conv = json.dumps(msgs, default=str)[:80000]
-    r = client.messages.create(model=MODEL, messages=[{"role": "user", "content":
-        "Summarize this coding-agent conversation so work can continue.\n"
-        "Preserve: 1. current goal, 2. key findings, 3. files changed, 4. remaining work, 5. user constraints.\n\n" + conv}],
-        max_tokens=2000)
-    return extract_text(r.content).strip()
-
-def compact_history(msgs):
-    write_transcript(msgs)
-    summary = summarize_history(msgs)
-    return [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
-
-def reactive_compact(msgs):
-    write_transcript(msgs)
-    summary = summarize_history(msgs)
-    tail_start = max(0, len(msgs) - 5)
-    if (tail_start > 0 and tail_start < len(msgs)
-            and _is_tool_result_message(msgs[tail_start])
-            and _message_has_tool_use(msgs[tail_start - 1])):
-        tail_start -= 1
-    return [{"role": "user", "content": f"[Reactive compact]\n\n{summary}"}, *msgs[tail_start:]]
+def run_claim_task(task_id: str) -> str:
+    return claim_task(task_id, owner="agent")
 
 
-# ═══════════════════════════════════════════════════════════
-#  Tool Definitions (skeleton — fewer tools to focus on memory)
-# ═══════════════════════════════════════════════════════════
+def run_complete_task(task_id: str) -> str:
+    return complete_task(task_id)
+
 
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+     "input_schema": {"type": "object",
+                      "properties": {"command": {"type": "string"}},
+                      "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+     "input_schema": {"type": "object",
+                      "properties": {"path": {"type": "string"},
+                                     "limit": {"type": "integer"}},
+                      "required": ["path"]}},
     {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern.",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
-    {"name": "task", "description": "Launch a subagent to handle a subtask.",
-     "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]}},
+     "input_schema": {"type": "object",
+                      "properties": {"path": {"type": "string"},
+                                     "content": {"type": "string"}},
+                      "required": ["path", "content"]}},
+    {"name": "create_task",
+     "description": "Create a new task with optional blockedBy dependencies.",
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "subject": {"type": "string"},
+                          "description": {"type": "string"},
+                          "blockedBy": {"type": "array",
+                                        "items": {"type": "string"}}},
+                      "required": ["subject"]}},
+    {"name": "list_tasks",
+     "description": "List all tasks with status, owner, and dependencies.",
+     "input_schema": {"type": "object", "properties": {},
+                      "required": []}},
+    {"name": "get_task",
+     "description": "Get full details of a specific task by ID.",
+     "input_schema": {"type": "object",
+                      "properties": {"task_id": {"type": "string"}},
+                      "required": ["task_id"]}},
+    {"name": "claim_task",
+     "description": "Claim a pending task. Sets owner, changes status to in_progress.",
+     "input_schema": {"type": "object",
+                      "properties": {"task_id": {"type": "string"}},
+                      "required": ["task_id"]}},
+    {"name": "complete_task",
+     "description": "Complete an in-progress task. Reports unblocked downstream tasks.",
+     "input_schema": {"type": "object",
+                      "properties": {"task_id": {"type": "string"}},
+                      "required": ["task_id"]}},
 ]
 
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
-    "edit_file": run_edit, "glob": run_glob, "task": spawn_subagent,
+    "create_task": run_create_task, "list_tasks": run_list_tasks,
+    "get_task": run_get_task, "claim_task": run_claim_task,
+    "complete_task": run_complete_task,
 }
 
 
-# ═══════════════════════════════════════════════════════════
-#  agent_loop — s09: inject memories + extract after each turn
-# ═══════════════════════════════════════════════════════════
+# ── Context ──
 
-MAX_REACTIVE_RETRIES = 1
+def update_context(context: dict, messages: list) -> dict:
+    """Derive context from real state."""
+    memories = ""
+    if MEMORY_INDEX.exists():
+        content = MEMORY_INDEX.read_text().strip()
+        if content:
+            memories = content
+    return {
+        "enabled_tools": list(TOOL_HANDLERS.keys()),
+        "workspace": str(WORKDIR),
+        "memories": memories,
+    }
 
-def agent_loop(messages: list):
-    reactive_retries = 0
-    # s09: inject relevant memory content into the current user turn
-    memories_content = load_memories(messages)
-    memory_turn = len(messages) - 1 if messages and isinstance(messages[-1].get("content"), str) else None
-    # s09: build system once per user turn; memory is updated after the loop returns
-    system = build_system()
 
+# ── Agent Loop (simplified, focused on task system) ──
+
+def agent_loop(messages: list, context: dict):
+    system = get_system_prompt(context)
     while True:
-        # s09: save pre-compression snapshot for accurate memory extraction
-        pre_compress = [m if isinstance(m, dict) else {"role": m.get("role",""),
-            "content": str(m.get("content",""))} for m in messages]
-
-        # s08: compression pipeline (budget → snip → micro)
-        messages[:] = tool_result_budget(messages)
-        messages[:] = snip_compact(messages)
-        messages[:] = micro_compact(messages)
-
-        if estimate_size(messages) > CONTEXT_LIMIT:
-            print("[auto compact]")
-            messages[:] = compact_history(messages)
-
         try:
-            request_messages = messages
-            if memories_content and memory_turn is not None and memory_turn < len(messages):
-                request_messages = messages.copy()
-                request_messages[memory_turn] = {
-                    **messages[memory_turn],
-                    "content": memories_content + "\n\n" + messages[memory_turn]["content"],
-                }
             response = client.messages.create(
-                model=MODEL, system=system, messages=request_messages, tools=TOOLS, max_tokens=8000
-            )
-            reactive_retries = 0
+                model=MODEL, system=system, messages=messages,
+                tools=TOOLS, max_tokens=8000)
         except Exception as e:
-            if ("prompt_too_long" in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries < MAX_REACTIVE_RETRIES:
-                print("[reactive compact]")
-                messages[:] = reactive_compact(messages)
-                reactive_retries += 1
-                continue
-            raise
+            messages.append({"role": "assistant", "content": [
+                {"type": "text",
+                 "text": f"[Error] {type(e).__name__}: {e}"}]})
+            return
 
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
-            # s09: extract from pre-compression snapshot for full fidelity
-            extract_memories(pre_compress)
-            consolidate_memories()
             return
 
         results = []
         for block in response.content:
-            if block.type != "tool_use": continue
+            if block.type != "tool_use":
+                continue
             print(f"\033[36m> {block.name}\033[0m")
             handler = TOOL_HANDLERS.get(block.name)
             output = handler(**block.input) if handler else f"Unknown: {block.name}"
-            print(str(output)[:200])
-            results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+            print(str(output)[:300])
+            results.append({"type": "tool_result",
+                            "tool_use_id": block.id, "content": output})
         messages.append({"role": "user", "content": results})
+        context = update_context(context, messages)
+        system = get_system_prompt(context)
 
 
 if __name__ == "__main__":
-    print("s09: Memory — persistent cross-session knowledge")
-    print("输入问题，回车发送。输入 q 退出。\n")
+    print("s12: task system")
+    print("Enter a question, press Enter to send. Type q to quit.\n")
     history = []
+    context = update_context({}, [])
     while True:
-        try: query = input("\033[36ms09 >> \033[0m")
-        except (EOFError, KeyboardInterrupt): break
-        if query.strip().lower() in ("q", "exit", ""): break
+        try:
+            query = input("\033[36ms12 >> \033[0m")
+        except (EOFError, KeyboardInterrupt):
+            break
+        if query.strip().lower() in ("q", "exit", ""):
+            break
         history.append({"role": "user", "content": query})
-        agent_loop(history)
+        agent_loop(history, context)
+        context = update_context(context, history)
         for block in history[-1]["content"]:
-            if getattr(block, "type", None) == "text": print(block.text)
+            if getattr(block, "type", None) == "text":
+                print(block.text)
         print()

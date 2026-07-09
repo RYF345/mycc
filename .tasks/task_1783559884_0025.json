@@ -1,0 +1,10 @@
+{
+  "id": "task_1783559884_0025",
+  "subject": "Write tests",
+  "description": "Write comprehensive tests for the API endpoints",
+  "status": "completed",
+  "owner": "agent",
+  "blockedBy": [
+    "task_1783559881_0024"
+  ]
+}
